@@ -1,10 +1,11 @@
 import React, { useEffect, useMemo, useState, useRef } from 'react';
 import { createRoot } from 'react-dom/client';
 import { bitable, FieldType, IFieldMeta, ITable, IView } from '@lark-base-open/js-sdk';
-import { Button, Card, Divider, Radio, Select, Space, Spin, Typography, message, Switch, Tooltip, Checkbox, Input, Modal } from 'antd';
+import { Button, Card, Divider, Radio, Select, Space, Spin, Typography, message, Switch, Checkbox, Input, Modal } from 'antd';
 import 'antd/dist/reset.css';
 import { saveAs } from 'file-saver';
 import { Document, Packer, Paragraph, Table, TableCell, TableRow, TextRun, WidthType, AlignmentType } from 'docx';
+import JSZip from 'jszip';
 import { DndContext, closestCenter, PointerSensor, useSensor, useSensors, DragEndEvent } from '@dnd-kit/core';
 import { SortableContext, verticalListSortingStrategy, useSortable, arrayMove } from '@dnd-kit/sortable';
 import { CSS } from '@dnd-kit/utilities';
@@ -106,6 +107,25 @@ function App() {
   const [showTemplateModal, setShowTemplateModal] = useState<boolean>(false);
   const [templateName, setTemplateName] = useState<string>('');
   const [selectedTemplateId, setSelectedTemplateId] = useState<string>('');
+  const [wordTemplateName, setWordTemplateName] = useState<string>('');
+  const [wordTemplateBuffer, setWordTemplateBuffer] = useState<ArrayBuffer | null>(null);
+  const [variablePreview, setVariablePreview] = useState<{ key: string; desc: string; sample: string }[]>([]);
+
+
+  const normalizeTemplateValue = (value: any) => {
+    if (value === null || value === undefined) return '';
+    return String(value);
+  };
+
+  const copyVariable = async (value: string) => {
+    try {
+      if (!navigator?.clipboard?.writeText) throw new Error('clipboard not available');
+      await navigator.clipboard.writeText(value);
+      message.success('变量已复制');
+    } catch {
+      message.warning('复制失败，请手动复制');
+    }
+  };
 
   // dnd-kit 传感器
   const sensors = useSensors(
@@ -551,6 +571,70 @@ function App() {
     return String(val);
   };
 
+  const buildTemplateRecords = async (headers: string[], recordIds: string[]) => {
+    if (!table) return [] as any[];
+    const records: any[] = [];
+    for (let i = 0; i < recordIds.length; i++) {
+      const rid = recordIds[i];
+      const fieldValues: Record<string, string> = {};
+      for (const fid of headers) {
+        const field = await table.getField(fid);
+        const val = await field.getValue(rid);
+        const fm = fieldMetas.find(f => f.id === fid);
+        fieldValues[fid] = formatValue(val, fm);
+      }
+      records.push({
+        record_id: rid,
+        record_index: i + 1,
+        field: fieldValues,
+      });
+    }
+    return records;
+  };
+
+  const escapeXml = (value: string) => value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
+
+  const refreshVariablePreview = async () => {
+    if (!table) return;
+    try {
+      const headers = await getEffectiveHeaderIds();
+      const ids = await getEffectiveRecordIds();
+      const firstId = ids[0];
+      const firstRecord = firstId ? (await buildTemplateRecords(headers, [firstId]))[0] : null;
+      const previewRecords = ids.length ? await buildTemplateRecords(headers, ids.slice(0, 20)) : [];
+      const preview = [
+        { key: '{{custom_title}}', desc: '当前导出标题', sample: customTitle },
+        { key: '{{record_count}}', desc: '当前导出记录数', sample: String(ids.length) },
+        { key: '{{generated_at}}', desc: '导出时间', sample: new Date().toLocaleString('zh-CN') },
+      ];
+      headers.forEach((fid) => {
+        const name = fieldMetas.find(f => f.id === fid)?.name || fid;
+        const allValues = previewRecords
+          .map(r => normalizeTemplateValue(r.field?.[fid]))
+          .filter(v => v !== '')
+          .join(' | ');
+        preview.push({
+          key: `{{field.${fid}}}`,
+          desc: `字段「${name}」(ID: ${fid})`,
+          sample: firstRecord?.field?.[fid] || '',
+        });
+        preview.push({
+          key: `{{column.${fid}}}`,
+          desc: `字段「${name}」全记录（换行拼接）`,
+          sample: allValues,
+        });
+      });
+      setVariablePreview(preview);
+    } catch (e: any) {
+      message.error('刷新变量示例失败：' + (e?.message || '未知错误'));
+    }
+  };
+
   // 记录排序
   const sortRecordIds = async (ids: string[], fieldId: string, dir: SortDirection) => {
     if (!table) return ids;
@@ -637,6 +721,91 @@ function App() {
       message.success('Word 导出成功');
     } catch (e: any) {
       message.error('导出失败：' + e?.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const onTemplateFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    if (!file.name.toLowerCase().endsWith('.docx')) {
+      message.error('仅支持 .docx 模板文件');
+      return;
+    }
+    const buffer = await file.arrayBuffer();
+    setWordTemplateBuffer(buffer);
+    setWordTemplateName(file.name);
+    await refreshVariablePreview();
+    message.success('Word 模板已导入');
+  };
+
+  const clearWordTemplate = () => {
+    setWordTemplateBuffer(null);
+    setWordTemplateName('');
+    message.success('已清空模板');
+  };
+
+  const exportByWordTemplate = async () => {
+    if (!table) return;
+    if (!wordTemplateBuffer) {
+      message.error('请先导入 Word 模板');
+      return;
+    }
+    setLoading(true);
+    try {
+      const headers = await getEffectiveHeaderIds();
+      const ids = await getEffectiveRecordIds();
+      const records = await buildTemplateRecords(headers, ids);
+      const firstRecord = records[0] || { field: {}, record_id: '', record_index: 0 };
+
+      const replaceMap: Record<string, string> = {
+        '{{custom_title}}': customTitle,
+        '{{record_count}}': String(records.length),
+        '{{generated_at}}': new Date().toLocaleString('zh-CN'),
+        '{{first_record.record_id}}': firstRecord.record_id || '',
+        '{{first_record.record_index}}': String(firstRecord.record_index || 0),
+      };
+
+      headers.forEach((fid) => {
+        replaceMap[`{{field.${fid}}}`] = firstRecord.field?.[fid] || '';
+        const colValues = records.map(r => r.field?.[fid] || '').join('\n');
+        replaceMap[`{{column.${fid}}}`] = colValues;
+      });
+
+      const zip = await JSZip.loadAsync(wordTemplateBuffer);
+      const xmlPaths = Object.keys(zip.files).filter(path => /^word\/(document|header\d+|footer\d+)\.xml$/.test(path));
+      if (!xmlPaths.includes('word/document.xml')) throw new Error('模板缺少 word/document.xml');
+
+      let unresolvedSet = new Set<string>();
+      let replacedCount = 0;
+      for (const xmlPath of xmlPaths) {
+        const xml = await zip.file(xmlPath)?.async('string');
+        if (!xml) continue;
+        let outXml = xml;
+        Object.entries(replaceMap).forEach(([k, v]) => {
+          const escaped = escapeXml(v);
+          const hitCount = outXml.split(k).length - 1;
+          if (hitCount > 0) replacedCount += hitCount;
+          outXml = outXml.split(k).join(escaped);
+        });
+        const unresolved = outXml.match(/\{\{[^{}]+\}\}/g) || [];
+        unresolved.forEach(token => unresolvedSet.add(token));
+        zip.file(xmlPath, outXml);
+      }
+
+      const blob = await zip.generateAsync({ type: 'blob' });
+      saveAs(blob, `${customTitle}-模板导出.docx`);
+      if (replacedCount === 0) {
+        message.warning('导出完成，但模板中未匹配到任何占位符；请检查占位符是否为连续文本。');
+      } else if (unresolvedSet.size > 0) {
+        const unresolvedList = Array.from(unresolvedSet).slice(0, 6).join('、');
+        message.warning(`导出成功，已替换 ${replacedCount} 处；仍有未替换变量：${unresolvedList}${unresolvedSet.size > 6 ? '...' : ''}`);
+      } else {
+        message.success(`按模板导出成功（已替换 ${replacedCount} 处）`);
+      }
+    } catch (e: any) {
+      message.error('按模板导出失败：' + (e?.message || '请检查模板内容'));
     } finally {
       setLoading(false);
     }
@@ -813,6 +982,38 @@ function App() {
           )}
         </Card>
 
+        <Card size="small" title="Word 模板导入与字段变量映射">
+          <Space direction="vertical" style={{ width: '100%' }}>
+            <Space wrap>
+              <input type="file" accept=".docx" onChange={onTemplateFileChange} />
+              <Text type="secondary">{wordTemplateName ? `已导入：${wordTemplateName}` : '未导入模板'}</Text>
+              <Button onClick={refreshVariablePreview}>刷新变量示例</Button>
+              <Button onClick={clearWordTemplate} disabled={!wordTemplateBuffer}>清空模板</Button>
+            </Space>
+            <Text type="secondary">
+              在模板中可使用：{'{{custom_title}}'}、{'{{generated_at}}'}、{'{{record_count}}'}、{'{{first_record.record_id}}'}。
+              字段映射：{'{{field.fldxxxxxx}}'} 代表首条记录字段值，{'{{column.fldxxxxxx}}'} 代表该字段所有记录值（换行拼接）。
+            </Text>
+            <div style={{ maxHeight: 220, overflow: 'auto', border: '1px solid #f0f0f0', borderRadius: 6, padding: 8 }}>
+              {variablePreview.length === 0 ? (
+                <Text type="secondary">点击“刷新变量示例”后可查看字段映射变量和值示例。</Text>
+              ) : (
+                <Space direction="vertical" style={{ width: '100%' }} size={4}>
+                  {variablePreview.map(item => (
+                    <div key={item.key} style={{ display: 'flex', justifyContent: 'space-between', gap: 12 }}>
+                      <Button type="link" style={{ paddingInline: 0 }} onClick={() => copyVariable(item.key)}>
+                        <Text code>{item.key}</Text>
+                      </Button>
+                      <Text type="secondary" style={{ flex: 1 }}>{item.desc}</Text>
+                      <Text ellipsis style={{ maxWidth: 260 }}>{item.sample || '-'}</Text>
+                    </div>
+                  ))}
+                </Space>
+              )}
+            </div>
+          </Space>
+        </Card>
+
         {/* 操作按钮已迁移到底部固定工具栏 */}
       </Space>
 
@@ -855,6 +1056,7 @@ function App() {
           >删除模板</Button>
           <Divider type="vertical" />
           <Button type="primary" onClick={exportWord}>导出 Word</Button>
+          <Button type="primary" ghost onClick={exportByWordTemplate} disabled={!wordTemplateBuffer}>按模板导出 Word</Button>
           <Button onClick={printNow}>打印</Button>
         </Space>
       </div>
