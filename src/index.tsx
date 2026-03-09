@@ -110,6 +110,7 @@ function App() {
   const [wordTemplateName, setWordTemplateName] = useState<string>('');
   const [wordTemplateBuffer, setWordTemplateBuffer] = useState<ArrayBuffer | null>(null);
   const [variablePreview, setVariablePreview] = useState<{ key: string; desc: string; sample: string }[]>([]);
+  const [initError, setInitError] = useState<string>('');
 
 
   const normalizeTemplateValue = (value: any) => {
@@ -154,6 +155,10 @@ function App() {
     const init = async () => {
       setLoading(true);
       try {
+        if (!(bitable as any)?.base?.getActiveTable) {
+          setInitError('当前不在飞书多维表格插件运行环境。请在飞书多维表格中打开此插件。');
+          return;
+        }
         const t = await bitable.base.getActiveTable();
         setTable(t);
         // 尝试从 SDK 对象读取 tableId（不同版本字段名可能差异）
@@ -189,7 +194,9 @@ function App() {
         setOrderedFieldIds(metas.map(m => m.id));
         await loadPreferences(defaultFieldIds, metas.map(m => m.id));
       } catch (e: any) {
-        message.error('初始化失败：' + e?.message);
+        const msg = e?.message || '未知错误';
+        setInitError('初始化失败：' + msg);
+        message.error('初始化失败：' + msg);
       } finally {
         setLoading(false);
       }
@@ -870,6 +877,21 @@ function App() {
   };
 
   if (loading) return <div style={{ padding: 16 }}><Spin /> 初始化中...</div>;
+
+  if (initError) {
+    return (
+      <div style={{ padding: 16 }}>
+        <Title level={4}>飞书多维表格导出/打印插件</Title>
+        <Card size="small" title="运行环境提示">
+          <Space direction="vertical" style={{ width: '100%' }}>
+            <Text type="danger">{initError}</Text>
+            <Text>本地直接访问 <Text code>http://localhost:5173</Text> 仅用于页面调试，无法读取真实表格数据。</Text>
+            <Text>请前往 README 的“飞书开发平台配置与本地调试”章节完成插件配置后，在飞书多维表格侧边栏中打开本插件。</Text>
+          </Space>
+        </Card>
+      </div>
+    );
+  }
 
   return (
     <div style={{ padding: 16, paddingBottom: 88 }}>
